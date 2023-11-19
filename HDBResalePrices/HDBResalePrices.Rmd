@@ -1,0 +1,660 @@
+---
+title: "Analysis of HDB Resale Prices"
+author: "Dani-Tay"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    toc_depth: 2
+    highlight: textmate
+    theme: sandstone
+date: "`r Sys.Date()`"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Load Libraries
+
+```{r warning = FALSE, message = FALSE}
+library(tidyverse)
+library(e1071) # for skewness
+library(stats)
+library(ggpubr) # for correlation coefficient on plot
+library(gridExtra) # for arranging plots
+library(corrplot) # for correlation matrix
+library(car) # for vif
+library(rsample)
+library(DescTools)
+library(glmnet)
+library(plotmo)
+```
+
+# **Tidy Data**
+
+Let us first begin by cleaning and tidying up the hdb resale price data by:
+
+1.  Converting the `remaining_lease` variable into a numeric one, in terms of number of years
+2.  Separating the `storey_range` into the corresponding upper and lower storey numeric variables
+3.  Converting `flat_model` and `flat_type` variables to a factor
+
+We also remove any rows containing NAs and that are duplicates.
+
+```{r}
+resale <- read.csv("hdb.csv")
+
+resale <- resale %>% 
+  na.omit() %>% 
+  distinct %>% 
+  mutate(remaining_lease = ifelse(nchar(remaining_lease) > 8, 
+                                  as.numeric(substr(remaining_lease, 1, 2)) + as.numeric(substr(remaining_lease, 10, 11))/12,
+                                  as.numeric(substr(remaining_lease, 1, 2)))) %>% 
+  separate(storey_range, into = c("lower_storey", "upper_storey"), sep = " TO ", convert = TRUE) %>% 
+  mutate_at(vars("flat_model", "flat_type"), factor) %>% 
+  mutate(floors = upper_storey - lower_storey + 1)
+```
+
+# **Exploration of data**
+
+From the boxplots generated, we observe that there are quite a number of outliers for `floor_area_sqm`, `lower_storey`, `upper_storey` and
+`resale_transacted_price`. For now, we will not deal with the outliers, but these outliers wll be dealt with later on.
+
+Interestingly, we observe that all of the flats are based across a range of 3 floors.
+
+```{r}
+plot_data <- data.frame(
+  Variable = factor(rep(c("lower_storey", "upper_storey", "floors", "floor_area_sqm", "remaining_lease", "resale_transacted_price"), each = nrow(resale)),levels = c("lower_storey", "upper_storey", "floors", "floor_area_sqm", "remaining_lease", "resale_transacted_price")),
+  Value = c(resale$lower_storey, resale$upper_storey,resale$floors, resale$floor_area_sqm, resale$remaining_lease, resale$resale_transacted_price)
+)
+
+# Create a grid of box plots
+ggplot(plot_data, aes(x = Variable, y = Value)) +
+  geom_boxplot() +
+  labs(title = "Box Plots of Numeric variables", x = "Variable", y = "Value") +
+  theme_minimal() +
+  facet_wrap(~Variable, scales = "free")  
+```
+
+From the bar charts below, we observe that the distribution of the flat models is quite random but the common flat models are Model A, Improved, New Generation and Premium Apartment. We also observe that most of the flats are 4 room flats, while there seems to be a negligible number of 1 Room and Multi-generational flats. For now, let us keep the 1 Room and Multi-generational flats in our data but this is addressed later on in this project.
+
+```{r}
+# Create bar chart of flat_model
+ggplot(resale, aes(x = flat_model)) +
+  geom_bar() +
+  labs(title = "Distribution of flat models", x = "Flat Type", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Create bar_chart of flat_type
+ggplot(resale, aes(x = flat_type)) +
+  geom_bar() +
+  labs(title = "Distribution of flat types", x = "Flat Type", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+# **Possible Factors Affecting Price**
+
+Some likely factors that affect price, and that we want to study, are:
+
+1.  Floor (numeric) (We will take the lower storey to be representative
+    of the floor)
+2.  Floor area (numeric)
+3.  Flat type (categorical)
+4.  Remaining lease years (numeric)
+
+The categorical `flat_model` variable was omitted as a predictor variable as there are too many types of flat models which will reduce the interpretability of the model. On further research, we also find that flat models are generally a naming convention which changes from decade to decade and fundamentally is meant to reflect properties of the flat like the floor area and layout (Teoalida, n.d.), in which the former is already selected as a predictor.
+
+Additionally, we note that location is usually an important factor considered by flat buyers. However, diving deeper into what this really entails, it may include distance from the city center, the maturity of the estate, etc. Since we are limited to this dataset that only provides the categorical variable `town`, `street` and `block` which take many possible values, location is not a factor that we can effectively study the effects of.
+
+# **Checking Assumptions of Linear Regression**
+
+Since the predictor variable, resale price, is a numeric variable, I will be building the model using **linear regression**.
+
+Before we begin, we should check that the assumptions of multiple linear regression are satisfied. The assumptions are:
+
+1.  Each observation is independent from the others.
+2.  The relationships between the predictor variables X and the response variable Y are linear.
+3.  There is no multicollinearity between the predictor variables.
+4.  The residuals are normally distributed.
+5.  Homoscedasticity, which means the variance of the residuals are the same across all values of the predictor variables.
+
+Assumptions (1) to (3) can be checked before building the regression model and we will proceed to do so.
+
+## Independence
+
+We have no statistical way to verify that each observation is independent from the others. However, we can assume that the transactions are not related to each other and do not influence each other, such that each observation is independent from the others.
+
+## Relationship Between Predictor Variables and Response Variable
+
+For the numeric variables. Floor, Floor area and Remaining lease years, we check if they have a linear relationship with resale price.
+
+Typically, the strength of correlation is given by:  
+
+- −1 \< r \< −0.7 or 0.7 \< r \< 1: Strong Correlation.\
+- −0.7 ⩽ r \< −0.3 or 0.3 \< r ⩽ 0.7: Moderate Correlation.\
+- −0.3 ⩽ r \< 0 or 0 \< r ⩽ 0.3: Weak Correlation.
+
+Floor area is moderately correlated to the resale price, with **r = 0.62**.\
+The number of years left in the lease is moderately correlated to the resale price but much less so than floor area, with **r = 0.34**.\
+Similarly, floor number is moderately correlated to the resale price but much less so than floor area, with **r = 0.37**.
+
+In general, we can assume that the predictor variables are linearly related to the response variable, satisfying assumption (2).
+
+```{r warning = FALSE, message = FALSE}
+p.scatter.slr1 <-
+  ggplot(data = resale,
+         mapping = aes(y = resale_transacted_price, x = lower_storey)) +
+  geom_point() +
+  ylab("log(Resale Price)") +
+  xlab("Floor Number") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+
+p.scatter.slr2 <-
+  ggplot(data = resale,
+         mapping = aes(y = resale_transacted_price, x = floor_area_sqm)) +
+  geom_point() +
+  ylab("log(Resale Price)") +
+  xlab("Floor Area (sqm)") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+  
+p.scatter.slr3 <-
+  ggplot(data = resale,
+         mapping = aes(y = resale_transacted_price, x = remaining_lease)) +
+  geom_point() +
+  ylab("log(Resale Price)") +
+  xlab("Remaining Lease Years") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+
+grid.arrange(p.scatter.slr1, p.scatter.slr2, p.scatter.slr3, nrow=3,
+             layout_matrix = rbind(c(1), c(2), c(3)), heights = c(2, 2, 2))
+```
+
+## Preliminary Check for Multicollinearity
+
+Using the `cor()` function, all of the r values are less than 0.3 meaning that the predictor variables have a weak correlation with each other, which suggests that there is no multi-collinearity, satisfying assumption (2). When the model is built later on, this will be verified again with VIF.
+
+```{r}
+# Check for collinearity
+correlation <- cor(resale[,c("resale_transacted_price", "lower_storey", "floor_area_sqm", "remaining_lease")])
+corrplot(corr = correlation, method = 'number', type = 'upper')
+
+plot(resale[,c("resale_transacted_price", "lower_storey", "floor_area_sqm", "remaining_lease")], col = "darkblue", cex = 1.2)
+```
+
+# **Building Model 1**
+
+## Splitting Training and Test Dataset
+
+In order to be able to build and test our model, we split our dataset into 70:30 training and test and we use `initial_split` to split the dataset proportionately based on the `resale_transacted_price`. Based on the documentation of rsample, using the `strata` argument in `initial_split`, numeric strata are binned into quartiles.
+
+```{r}
+# Split dataset into training & test
+set.seed(123)
+partition <- initial_split(resale, prop = 0.7, strata = "resale_transacted_price") # Split by stratification based on resale price
+train <- training(partition)
+test <- testing(partition)
+```
+
+## Fitting the Model to the Training Data
+
+Using hypothesis testing, we decide if the predictor variables have a significant impact on resale price.\
+H0 : The model with no predictor variable fits the data as good as the current regression model (β1 = β2 = β3 = 0).\
+H1 : The current regression model fits the data better than the model with no predictor variable (At least one of β1, β2, β3 $\neq$ 0).
+
+Setting a significance level of 5% and checking the P-value for each predictor variable in the fitted regression model, Floor, Floor area and Remaining lease years have p-values \< 2e-16 but for the Flat Type, the significance seems to be mixed.
+
+We notice that the adjusted $R^2$ value is only **0.5529**, which is considerably low. This pushes us to refine the predictor variables used in the model.
+
+```{r}
+model1 <- lm(formula = resale_transacted_price ~ lower_storey + floor_area_sqm + remaining_lease + flat_type, 
+          data = train)
+summary(model1)
+```
+
+## Checking Assumptions
+We want to verify the assumptions required for linear regression, that we were unable to check earlier:  
+
+- There is no multicollinearity between the predictor variables.
+- The residuals are normally distributed.
+- Homoscedasticity, which means the variance of the residuals are the same across all values of the predictor variables.
+
+### Checking Multicollinearity
+
+From the fitted regression model, we compute the VIF to assess multicollinearity.
+
+The GVIF\^(1/(2\*Df)) value, which is normalised, of `lower_storey` (floor), `remaining_lease` and `flat_type` is close to 1 which indicates that the predictor variables are uncorrelated with all the other predictors. However, `floor_area_sqm` seems to be more correlated to flat_type with a GVIF\^(1/(2\*Df)) of 3.376531 which is greater than $\sqrt{10}=3.1622$.
+This suggests that there may be some multicollinearity in the model.
+
+```{r}
+# Compute Variance Inflation Factor (VIF)
+vif(model1)
+```
+
+### Checking Normality of Residuals
+From the histogram of the residuals, the residuals seem to be slightly **right skewed** due to the longer tail on the right than the left, meaning that it is not very normally distributed. From the qqplot of the residuals, we can also see that the resale flats with lower prices seem to fit a normal distribution well but **as the price increases, the points on the qqplot deviate increasingly from the identity line**.
+```{r}
+# Check residuals are normally distributed
+ggplot(mapping = aes(x = rstandard(model1))) +
+  geom_histogram(bins = 50) +
+  labs(x = "Standardised Residuals",
+       y = "Resale Price",
+       title = "Histogram of Residuals")
+
+# Generate qqplot (which = 2 selects only qqplot)
+plot(model1, which = 2)
+```
+
+
+### Checking Homoscedasticity
+In the residual plot, the residuals are not evenly scattered and seem to **diverge as price increases**. This indicates the **lack of homoscedasticity**.
+
+```{r}
+# Generate diagnostic plot (which = 1 selects only residual plot)
+plot(model1, which = 1)
+```
+
+# **Build Model 2: Transformation**
+
+The residual plot seems to suggest that transformation of the response variable is required since the model fits less and less well as the resale price increases. 
+
+In fact, looking back at the initial scatterplots plotted of the numeric predictor variables against `resale_transacted_price`, we observe that `floor_area_sqm` and `lower_storey` especially, do indeed seem to display a logarithmic relationship with `resale_transacted_price`. Let us confirm this by calculating the correlation coefficient when different log transformations are performed. We observe that when we log(resale-transacted_price), the correlation coefficient increases from before. Even though the highest linear correlation is achieved when we also apply a log transformation to `floor_area_sqm` and `remaining_lease`, we avoid doing so as the final regression equation would become harder to interpret mathematically. The scatterplot of `log(resale_transacted_price)` against `floor_area_sqm`, `remaining_lease` and `lower_storey` also shows that the relationship is more linear than before.
+
+```{r}
+cor_values_floor <- data.frame(
+  Variables = c("Resale Price vs Lower Storey", "Resale Price vs Log Lower Storey",
+                "Log Resale Price vs Lower Storey", "Log Resale Price vs Log Lower Storey"),
+  Correlation = c(
+    cor(resale$resale_transacted_price, resale$lower_storey),
+    cor(resale$resale_transacted_price, log(resale$lower_storey)),
+    cor(log(resale$resale_transacted_price), resale$lower_storey),
+    cor(log(resale$resale_transacted_price), log(resale$lower_storey))
+  )
+)
+
+print(cor_values_floor)
+```
+
+```{r}
+cor_values_floor_area <- data.frame(
+  Variables = c("Resale Price vs Floor Area", "Resale Price vs Log Floor Area",
+                "Log Resale Price vs Floor Area", "Log Resale Price vs Log Floor Area"),
+  Correlation = c(
+    cor(resale$resale_transacted_price, resale$floor_area_sqm),
+    cor(resale$resale_transacted_price, log(resale$floor_area_sqm)),
+    cor(log(resale$resale_transacted_price), resale$floor_area_sqm),
+    cor(log(resale$resale_transacted_price), log(resale$floor_area_sqm))
+  )
+)
+
+print(cor_values_floor_area)
+```
+```{r}
+cor_values_lease <- data.frame(
+  Variables = c("Resale Price vs Remaining Lease", "Resale Price vs Log Remaining Lease",
+                "Log Resale Price vs Remaining Lease", "Log Resale Price vs Log Remaining Lease"),
+  Correlation = c(
+    cor(resale$resale_transacted_price, resale$remaining_lease),
+    cor(resale$resale_transacted_price, log(resale$remaining_lease)),
+    cor(log(resale$resale_transacted_price), resale$remaining_lease),
+    cor(log(resale$resale_transacted_price), log(resale$remaining_lease))
+  )
+)
+
+print(cor_values_lease)
+```
+
+```{r message = FALSE}
+p.scatter4 <-
+  ggplot(data = resale,
+         mapping = aes(y = log(resale_transacted_price), x = lower_storey)) +
+  geom_point() +
+  labs(title = "Log Resale Price vs Floor") +
+  ylab("log(Resale Price)") +
+  xlab("Floor Number") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+
+p.scatter5 <-
+  ggplot(data = resale,
+         mapping = aes(y = log(resale_transacted_price), x = floor_area_sqm)) +
+  geom_point() +
+  labs(title = "Log Resale Price vs Floor Area (Sqm)") +
+  ylab("log(Resale Price)") +
+  xlab("Floor Area (sqm)") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+
+p.scatter6 <-
+  ggplot(data = resale,
+         mapping = aes(y = log(resale_transacted_price), x = remaining_lease)) +
+  geom_point() +
+  labs(title = "Log Resale Price vs Remaining Lease Period") +
+  ylab("log(Resale Price)") +
+  xlab("Remaing Lease Years") +
+  geom_smooth(method = "lm") +
+  stat_cor(method = "pearson", mapping = aes(label = paste("r", ..r.., sep = "~`=`~")), color = "red")
+
+grid.arrange(p.scatter4, p.scatter5, p.scatter6, nrow = 3, heights = c(3, 3, 3))
+```
+
+
+We thus use a **logarithmic transformation on the `resale_transacted_price`** variable in order to create an exponential model.
+
+Indeed, in doing so, the goodness of fit of the model increases as the adjusted **$R^2$ increases from 0.5529 to 0.6235**. Additionally, the p-values of the variable coefficients has also improved with **all except that for `flat_type2 ROOM` being less than 0.05**.
+
+```{r}
+model2 <- lm(formula = log(resale_transacted_price) ~ lower_storey + floor_area_sqm + remaining_lease + flat_type, 
+          data = train)
+summary(model2)
+```
+
+## Check Assumptions
+### Checking Normality
+Now, we see that the histogram of the residuals is less right-skewed than before and in the qqplot, the points deviate less significantly from the identity line. This indicates that the **residuals are closer to a normal distribution than before the log transformation**. 
+```{r}
+# Check residuals are normally distributed
+ggplot(mapping = aes(x = rstandard(model2))) +
+  geom_histogram(bins = 50) +
+  labs(x = "Standardised Residuals",
+       y = "Resale Price",
+       title = "Histogram of Residuals")
+
+# Generate qqplot (which = 2 selects only qqplot)
+plot(model2, which = 2)
+```
+
+
+### Checking Homoscedasticity
+From the residual plot, the residuals also seem more evenly scattered than before. From the qqplot, the residuals seem slightly more evenly scattered than before and we can conclude that the **homoscedasticity assumption is satisfied**.
+
+```{r}
+
+# Check residuals are evenly scattered
+# Generate diagnostic plot (which = 1 selects only residual plot)
+plot(model2, which = 1)
+```
+
+# **Build Model 3**
+
+## Removing 1 ROOM & MULTI-GENERATION Flats
+
+We attempt to remove 1 room and executive flats, which are rarer flat types and whose prices are generally at the extreme ends of the price range, to see the impact on the fit of the model.
+
+```{r}
+train2 <- train %>% 
+  filter(!flat_type %in% c("1 ROOM", "MULTI-GENERATION")) %>% 
+  arrange(flat_type)
+```
+
+## Fit New Model
+
+We see that the adjusted $R^2$ actually decreases slightly **from 0.6235 down to 0.6219**, even though all of the predictor variables now have a p-value of \<2e-16, meaning that they are all significant. Nonetheless the decrease in $R^2$ value suggests that this change did not improve the fit of the model.
+
+```{r}
+model3 <- lm(formula = log(resale_transacted_price) ~ lower_storey + floor_area_sqm + remaining_lease + flat_type, data = train2)
+summary(model3)
+```
+
+## Checking Assumptions 
+
+Checking the histogram, qqplot and residual plot of the residuals in this model, we see that there is no noticeable change and the residuals still diverge from a normal distribution at the extreme ends. Thus, we can conclude that removing the 1 Room and Multi-Generation flats did not improve the model fit.
+
+```{r}
+# Check residuals are normally distributed
+ggplot(mapping = aes(x = rstandard(model3))) +
+  geom_histogram(bins = 50) +
+  labs(x = "Standardised Residuals",
+       y = "Resale Price",
+       title = "Histogram of Residuals")
+
+# Generate qqplot (which = 2 selects only qqplot)
+plot(model3, which = 2)
+
+# Check if residuals are evenly scattered
+# Generate diagnostic plot (which = 1 selects only residual plot)
+plot(model3, which = 1)
+```
+
+# **Build Model 4: Removing Influential Points**
+
+## Checking for Influential Points
+
+Building on **Model 2**, we check the Cook's Distance of the observations to identify any influential points. Based on literature, a Cook's Distance of more than 3 times the mean Cook's Distnce is taken as the threshold for identifying influential points.
+
+```{r}
+# Visualise Cook's distance
+plot(model2, which=4)
+cooksD <- cooks.distance(model2)
+mean.cooksD <- mean(cooksD, na.rm = TRUE)
+
+# Identify influential points where Cook's distance > 3 times of mean Cook's distance
+influential <- cooksD[cooksD > (3 * mean.cooksD)]
+```
+
+## Removing Outliers
+
+Removing the outliers actually improved the fit of the model as the **Adjusted $R^2$ value increased from 0.6235 to 0.6674**. However, the p-value for the variable flat_type2 ROOM is still greater than 0.05 meaning that the coefficient is statistically insignificant.
+
+```{r}
+train3 <- train[!(row.names(train) %in% names(influential)), ]
+
+model4 <- lm(formula = log(resale_transacted_price) ~ lower_storey + floor_area_sqm + remaining_lease + flat_type,
+          data = train3)
+summary(model4)
+
+betas <- as.list(coef(model4))
+```
+
+## Checking Distribution of Residuals and Homoscedasticity
+
+Checking the histogram, qqplot and residual plot of the residuals in this model, we see that there is no significant change, although the residuals are slightly more evenly scattered. 
+```{r}
+# Check residuals are normally distributed
+ggplot(mapping = aes(x = rstandard(model4))) +
+  geom_histogram(bins = 50) +
+  labs(x = "Standardised Residuals",
+       y = "Resale Price",
+       title = "Histogram of Residuals")
+
+# Generate qqplot (which = 2 selects only qqplot)
+plot(model4, which = 2)
+
+# Check residuals are evenly scattered
+# Generate diagnostic plot (which = 1 selects only residual plot)
+plot(model4, which = 1)
+```
+
+# **Build Model 5: Interaction Effect**
+Finally, for simple linear regression, let us explore the interaction effect, especially between `floor_area_sqm` and `flat_type` which we have found to be correlated. We begin with fitting the linear regression model using a log transportation and the interaction effect between `floor_area_sqm` and `flat_type`. We then remove the outliers based on the Cook's Distance and refit the model again.
+
+We obtain an $R^2$ value of only **0.6646** which is a deprovement from before. Additionally, the p-values of the interaction terms are all above 0.05 and hence are **not statistically significant**. Thus, Model 5 is less able to account for the variability of the data and is also less interpretable. Overall, the interaction effect has not helped to improve our model.
+```{r}
+modeltest <- lm(formula = log(resale_transacted_price) ~ lower_storey + floor_area_sqm * flat_type + remaining_lease, 
+          data = train)
+summary(modeltest)
+
+cooksD_inter <- cooks.distance(modeltest)
+mean.cooksD_inter <- mean(cooksD_inter, na.rm = TRUE)
+
+# Identify influential points where Cook's distance > 3 times of mean Cook's distance
+influential_inter <- cooksD_inter[cooksD_inter > (3 * mean.cooksD_inter)]
+
+traintest2 <- train[!(row.names(train) %in% names(influential_inter)), ]
+modeltest2 <- lm(formula = log(resale_transacted_price) ~ lower_storey + floor_area_sqm * flat_type + remaining_lease,
+          data = traintest2)
+summary(modeltest2)
+```
+
+# **Build Model 6: Elastic Net Regression**
+
+Earlier, we identified slight multicollinearity between `floor_area_sqm` and `flat_type` based on the normalised GVIF. However, we do not want to omit the predictor variables as far as possible, so we can try building a model using Elastic Net Regressio to hopefully address this by introducing regularisation.  
+
+Interestingly, the coefficients of `flat_type2 ROOM` and `flat_type3 ROOM` became negative while that of `flat_type4 ROOM` became 0. This is logical given that 2- and 3- room flats ought to be at the lower end of the price spectrum.  
+
+The alpha and lambda that gave us the lowest MSE is 0.2 and 0.002009013.  
+
+Let us also check the assumptions of LASSO and Ridge Regression which are:  
+
+1. Independence: Each observation is independent from the others.
+2. Linearity: The relationship, between the predictors Xs and the dependent variable Y, is linear.
+3. Constant Variance: The residuals are evenly scattered around the center line of zero.  
+
+Assumptions (1) and (2) have already been verified. Checking assumption (3), the residual plot looks similar to before, and so we conclude that there is homoscedasticity.
+
+
+```{r cache = TRUE}
+train.x <- model.matrix(log(resale_transacted_price) ~ lower_storey + floor_area_sqm + remaining_lease + flat_type, data = train)[, -1]
+train.y <- log(train$resale_transacted_price)
+test.x  <- model.matrix(log(resale_transacted_price) ~ lower_storey + floor_area_sqm + remaining_lease + flat_type, data = test)[, -1]
+test.y  <- log(test$resale_transacted_price)
+
+generate_cvmodels <- function (x) {
+  set.seed(123)
+  return(cv.glmnet(train.x, train.y,
+                  type.measure = "mse", alpha = x/10))
+}
+
+cv_models <- lapply(0:10, generate_cvmodels)
+
+# Generate cross-validation mses for all 11 models
+cv_error <- unlist(lapply(cv_models,
+                          function(x) x$cvm[x$lambda == x$lambda.min]))
+
+get_best_model <- function (models, errors) {
+
+  # models is a list of models, and
+  # errors is a list of errors
+  best_n <- which(errors == min(errors))
+  return(
+    data.frame(
+      alpha = (best_n - 1)/10,
+      lambda = models[[best_n]]$lambda.min,
+      CV_error = errors[best_n]
+    )
+  )
+}
+
+best_parameter <- get_best_model(cv_models, cv_error)
+best_parameter
+
+model6 <- glmnet(train.x,
+                 train.y,
+                 alpha = best_parameter$alpha,
+                 lambda = best_parameter$lambda)
+coef(model6)
+```
+
+```{r}
+# Check homoscedasticity
+# Predict on the test set
+predictions <- predict(model6, s=best_parameter$lambda, train.x)
+
+# Calculate residuals
+residuals <- train.y - predictions
+
+# Plot residuals against predicted values
+plot(predictions, residuals, main="Residuals vs Predicted Values", xlab="Predicted Values", ylab="Residuals")
+abline(h = 0, col = "lightgrey", lty = 2)
+```
+
+
+# **Evaluation of Models**
+
+Let us now evaluate the simple linear regression model (Model 4) and the elastic net regression model (Model 6), by comparing their performance. Using the initial training dataset and an Elastic Net Regression Model, we get a $R^2$ value of **0.6231** when fitted to the training data which is lower than that of Model 6.
+
+From the computation of the evaluation metrics, including MSE, MAE, RMSE and MAPE, when both model 4 and 6 is fitted to the training dataset and used to predict the test data, we find that the **errors are quite low**. For a fairer analysis, I also computed the MSE, as a percentage of the range of log values of `resale_transacted_price`, and found that for both models all the percentage MSE are below 2%.
+
+Thus, both models are considerably good as the errors from the training and test datasets are very similar and there does not seem to be overfitting. This is despite the fact that their adjusted $R^2$ value is not very high (< 0.7). Nonetheless, for the context of property prices in which the factors of consideration are subjective in nature, we would not expect all the variability to be accounted for.
+
+Yet, as expected, the use of Elastic Net Regression did not improve the model significantly since there was minimal overfitting or multicollinearity in the first place. Besides a drop in $R^2$ value, the MSE, MAE, RMSE and MAPE also became higher for both the training and test dataset.
+
+**Thus, we may conclude that the best model is Model 4.**
+
+```{r}
+# Return evaluation metrics
+eval_results <- function(fit, true, range) {
+  actual <- data.matrix(true)
+  SSE <- sum((actual - fit)^2)
+  SST <- sum((actual - mean(actual))^2)
+  R_square <- 1 - SSE / SST
+  data.frame(
+    MSE = MSE(fit, true),
+    MAE = MAE(fit, true),
+    RMSE = RMSE(fit, true),
+    MAPE = MAPE(fit, true),
+    percent_MSE = (MSE(fit, true)/(max(true)- min(true)))*100,
+    R2 = R_square
+  )
+}
+
+# Evaluation metrics for train data
+actual_train <- log(train3$resale_transacted_price)
+predicted_train <- predict(model4, newdata = train3)
+train_metrics <- eval_results(predicted_train, actual_train)
+
+# Evaluation metrics for test data
+actual_test <- log(test$resale_transacted_price)
+predicted_test <- predict(model4, newdata = test)
+test_metrics <- eval_results(predicted_test, actual_test)
+
+cbind(data.frame(dataset = c("train", "test")), rbind(train_metrics, test_metrics))
+
+# Evaluation metrics for train data
+fit <- predict(model6, train.x)
+true <- train.y
+train_metrics_elanet <- round(eval_results(fit, true), 4)
+
+# Evaluation metrics for test data
+fit <- predict(model6, test.x)
+true <- test.y
+test_metrics_elanet <- round(eval_results(fit, true), 4)
+
+cbind(data.frame(dataset = c("train", "test")), rbind(train_metrics_elanet, test_metrics_elanet))
+```
+
+
+# **Major Results and Findings**
+
+The formula of the multiple linear regression model is:\
+log(resale_transacted_price) = `r betas[[1]]` + `r betas[[2]]` \* lower_storey + `r betas[[3]]` \* floor_area_sqm + `r betas[[4]]` \* remaining_lease + `r betas[[5]]` \* flat_type2 ROOM + `r betas[[6]]` \* flat_type3 ROOM + `r betas[[7]]` \* flat_type4 ROOM + `r betas[[8]]` \* flat_type5 ROOM + `r betas[[9]]` \* flat_typeEXECUTIVE + `r betas[[10]]` \* flat_typeMULTI-GENERATION
+
+We see that there is a **positive correlation** between the predictor variables, `lower_storey`, `floor_area_sqm` and `remaining_lease`, and the response variable `resale_transacted_price` as their coefficients are positive. Also, as the `flat_type` becomes bigger, from 1 ROOM all the way to a multi-generation flat, the corresponding coefficient also increases meaning that bigger flat types have higher resale prices. All of these relationships that were predicted by the model agree with what we would expect in real life whereby people are generally willing to pay more for higher floors, a longer remaining lease, larger flats and improved/bigger flat types. 
+
+1. Lower Storey (lower_storey):  
+An increase of 1 floor is associated with a 0.0162562 increase in the log of the resale price.
+In terms of actual price, this translates to approximately 1.64% increase in price.
+
+2. Floor Area (floor_area_sqm):  
+A 1-unit increase in floor area is associated with a 0.0059747 increase in the log of the resale price.
+In actual price terms, this corresponds to approximately 0.05% increase.
+
+3. Remaining Lease (remaining_lease):  
+For each additional year of remaining lease, there is a 0.0040825 increase in the log of resale price.
+In actual price, this results in approximately 0.4% increase.
+
+Interestingly, I also performed a log transformation on the resale_transacted_price and obtained a model with a better fit. This suggests that as the predictor variables increase, the resale price increases exponentially. A possible reason could be that people who can afford to buy more expensive flats are more competitive and hence drive up prices between each other in order to secure the flat that they desire.
+
+Comparing the coefficients of the predictor variables, **the most influencing factors are flat type followed by floor** (represented by `lower_storey`) as their coefficients are the largest. Overall, flat type seems to be the most important influencing factor as the coefficient is much larger than the rest.
+
+
+# **Limitations and Recommendations**
+
+My model has a $R^2$ value of 0.6674 which indicates that the model is able to **account for 66.74% of the variability of the prices**, while the other 33.26% is unaccounted for. This is inclusive of random errors and the fact that other predictor variables were not accounted for due to the limited details of the flats documented in the data. A major limitation of this study is that price of resale flat was only predicted based on 4 variables: Floor, Floor area, Flat type and Remaining lease years. However, there are likely other influencing factors of resale price. 
+
+For instance, the town, street and block of each flat is provided in the data set, but as aforementioned, that in itself is not informative as it is usually not the exact address that matters but rather how the flat is positioned within its surrounding environment, such as the location to amenities. Additionally, based on common knowledge, some estates in Singapore are more popular and command higher resake prices. Nonetheless, this is usually fundamentally tied to factors such as the distance to the city center or the maturity of the estate. In fact, a similar analysis by Chan (2023) which included the predictor variables used in this study, also considered the time from the flat to Raffles Place and found that it was the second most important predictor after the floor area of the flat. Chan's study also considered other factors like the maturity of the estate, distance to LRT/MRT, the distance to a primary school and the distance to the nearest mall, but these factors were found to be less significant. Thus, data on the distance of each location to the city center should be collected and additionally used to build the regression model to improve its prediction accuracy.
+
+Furthermore, in this module, we have restricted ourselves to simple linear regression and elastic net regression. However, other models can also be used to achieve higher accuracy, such as Decision Tree and Random Forest, which proved to perform better in Chan's (2023) analysis.  
+
+In summary, my model has built a foundation for the analysis of factors affecting HDB resale prices in Singapore, and my suggestions to improve the model include collecting more information about the flats, particularly the **distance to the city center**, as well as using **other regression models** like Decision Tree or Random Forest which are not restricted to linear relationships. Using Random Forest Regression and a more extensive range of predictor variables, Chan's (2023) model was able to account for 92.7% of the variability of HDB resale prices.
+
+# **References**
+
+Chan, P. (2023, February 6). Understanding and predicting resale HDB flat prices in Singapore. Medium. https://towardsdatascience.com/understanding-and-predicting-resale-hdb-flat-prices-in-singapore-1853ec7069b0  
+\
+Teoalida. (n.d.). HDB flat types and their sizes. The world of Teoalida. https://www.teoalida.com/singapore/hdbflattypes/ 
