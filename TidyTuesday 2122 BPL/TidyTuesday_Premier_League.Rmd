@@ -1,0 +1,245 @@
+---
+title: "TidyTuesday Premier League 2021/2022"
+author: "Dani-Tay"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: sandstone
+date: "`r Sys.Date()`"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r message = FALSE, warning = FALSE, include = FALSE}
+library(tidyverse)
+library(plotly)
+library(tools)
+library(stringr)
+```
+
+Now, I don't watch football (or soccer if you prefer), but the guys in my family definitely do. Every BPL is a huge deal in the household, and maybe it's time I find out what this is all about. After this, I'm going to be a football expert \*wink\*  
+
+Let's start with reading in the data and getting it cleaned up. TidyTuesday doesn't include the weekly ranking data, so I'm getting that off of Kaggle.
+```{r message = FALSE, warning = FALSE, include = FALSE}
+soccer <- tidytuesdayR::tt_load('2023-04-04')$`soccer21-22`
+rank <- read.csv("weeklyrank.csv")
+```
+
+# **The Home Advantage**
+In the World of football, playing a match at Home has always been regarded as an advantage. But is that really the case? -- Do teams perform better at Home than Away? 
+
+## Wins
+Just from analysing the proportion of wins by the Home Team vs. the Away Team across the season, we can see that there is generally  a higher likelihood of the Home Team winning, with a probability of 43% compared to 34%.
+```{r}
+table(soccer$FTR)/nrow(soccer)*100
+```
+
+
+## Number of Goals
+In terms of the number of goals, it does also seem that teams perform better at Home than Away when we compare the mean. But I would argue that the difference is not as big as we would make it out to be.
+```{r}
+home_away <- soccer %>% 
+  select(FTHG, FTAG, HTHG, HTAG) %>% 
+  pivot_longer(`FTHG`: `HTAG`, names_to = "type", values_to = "goals") %>% 
+  mutate(time = ifelse(substr(type, 1, 2) == "HT", "Half", "Full")) %>% 
+  mutate(location = ifelse(substr(type, 3, 4) == "HG", "Home", "Away")) %>% 
+  select(-type)
+
+ggplot(data = home_away, aes(x = location, y = goals)) +
+  geom_boxplot(fill = "#8EC4FE", color = "#31418F", alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 4, size = 3, color = "black") +
+  facet_wrap(~time, scales = "free_y", labeller = labeller(time = c("Full" = "Full Time", "Half" = "Half Time"))) +
+  labs(
+    title = "Distribution of Goals in Soccer Matches",
+    subtitle = "Comparison of Home and Away Goals at Half Time and Full Time",
+    x = "Location",
+    y = "Number of Goals"
+  ) +
+  theme_minimal()
+```
+
+## Goal Difference
+What about the goal difference? Here, the goal difference is defined as the number of goals scored by the Home Team minus that scred by the Away Team. The average goal difference is about 0.20, which is a notable difference, although it probably is not substantial enough to suggest that the Home Team always has a high likelihood of winning.
+```{r}
+mean(soccer$FTHG - soccer$FTAG)
+```
+
+
+## Team Shooting Accuracy & Efficiency
+Let's dive deeper. A comparison of average shooting accuracy and efficiency across the season shows that as expected, most teams do indeed perform better when playing at Home. However, this is not always the case. Notably, teams like Liverpool and Leedss actually seem to perform worse at Home in terms of booth shooting accuracy ad efficiency. Even for teams that perform better at Home statistically, the difference in performance seems to be minute. This begs the question: Does it matter statistically if the team plays at Home or Away?
+```{r}
+accuracy <- soccer %>% 
+  mutate(accuracy_home = HST/HS,
+         accuracy_away = AST/AS,
+         efficiency_home = FTHG/HS,
+         efficiency_away = FTAG/AS) %>% 
+  mutate_at(vars("accuracy_home", "accuracy_away", "efficiency_home", "efficiency_away"), as.numeric)
+
+df <- data.frame()
+
+for (i in 1:nrow(accuracy)) {
+  df <- rbind(df, c(accuracy$HomeTeam[i], accuracy$accuracy_home[i], accuracy$efficiency_home[i], "home"))
+  df <- rbind(df, c(accuracy$AwayTeam[i], accuracy$accuracy_away[i], accuracy$efficiency_away[i], "away"))
+}
+
+colnames(df) <- c("Team", "Accuracy", "Efficiency", "Location")
+
+acc <- df %>% 
+  mutate_at(vars("Accuracy", "Efficiency"), as.numeric) %>% 
+  group_by(Team, Location) %>% 
+  summarize(mean_accuracy = mean(Accuracy),
+            mean_efficiency = mean(Efficiency),
+            .groups = "drop") 
+
+tmp <- acc %>% 
+  pivot_longer(`mean_accuracy`:`mean_efficiency`, names_to = "type", values_to = "value") %>% 
+  mutate(type = recode(type, "mean_accuracy" = "Accuracy", "mean_efficiency" = "Efficiency"))
+
+ggplot(data = tmp, aes(x = type, y = value, fill = Location)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("red3", "black"), labels = c("Away", "Home")) + 
+  geom_text(aes(y = value + 0.15, group = Location, label = round(value,2)), position = position_dodge(width = 1), size = 2.5) + 
+  facet_wrap(~Team, scales = "fixed", ncol = 5, drop = TRUE) +
+  labs(title = "Avg. Shooting Accuracy and Efficiency of Teams in BPL 2021 - 2022 Season",
+       caption = "Note: Shooting Accuracy & Efficiency are defined as the percentage of shots taken on target and constituted a goal respectively",
+       x = "",
+       y = "Performance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 8),
+        plot.caption = element_text(size = 7),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  coord_cartesian(ylim = c(0, 1)) 
+```
+
+# **Performance of teams across weeks**
+To keep the dataset clean lets only analyse the fluctuation of performance of the top 5 teams for the season, which are Man City, Liverpool, Chelsea, Tottenham and Arsenal. 
+
+## Ranking across Weeks
+From the beginning of the season, the teams are placed at different ranks and hence we see that some teams like Arsenal and Man City seem to make "huge comebacks", but this is probably associated with the initial ranking. After Week 15, the ranking of the teams seems to have settled, although Tottenham did overtake Arsenal in Week 32. Lets now take a look at how the teams progressed in terms of points.
+```{r}
+top_5 <- rank %>% 
+  filter(Week == 38, Rank <= 5) %>% 
+  pull(Team)
+
+ranks_top_5 <- rank %>% 
+  filter(Team %in% top_5)
+
+df_labels <- rank %>% 
+  filter(Week == 38, Team %in% top_5) 
+
+team_colors <- data.frame(
+  Color = c("#EF0107", "#034694", "#C8102E", "#6CADDF", "#001C58")
+)
+
+ggplot(data = ranks_top_5, aes(x = Week, y = Rank, color = Team)) +
+  # geom_point(size = 1.5, show.legend = FALSE) +
+  geom_smooth(se = FALSE, show.legend = FALSE, span = 0.4) +  # Add a smooth line
+  geom_text(data = df_labels, aes(label = Team),
+            hjust = "left", nudge_x = 1, size = 3.5, show.legend = FALSE) +
+  labs(x = "Week", y = "Rank",
+       title = "Team Rankings, by Week in the 2021 - 2022 BPL") +
+  scale_x_continuous(limits = c(0, 45)) +
+  scale_y_continuous(trans = "reverse", breaks = c(1, 5, 10, 15, 20)) +
+  scale_color_manual(values = team_colors$Color) +  # Set custom team colors
+  theme_minimal()
+```
+
+## Points Across Weeks
+Indeed, when we compare the points gained across the weeks, we observe that the top 5 times all seem to progress at the same rate, which reinforces my earlier point about how the ranking trends are misleading in the first couple weeks.
+```{r}
+labels <- rank %>% 
+  filter(Team %in% top_5, Week == 38) 
+
+rank %>% 
+  filter(Team %in% top_5) %>% 
+  ggplot() +
+  geom_line(aes(x = Week, y = Points, color = Team)) +
+  geom_text(data = labels, aes(x = Week, y = Points, label = Team),
+            hjust = "left", nudge_x = 1, nudge_y = c(2, -2, 2, 0, -2), size = 3.5, show.legend = FALSE) +
+  labs(x = "Week", y = "Points",
+       title = "Points by Week in the 2021 - 2022 BPL") +
+  scale_color_manual(values = team_colors$Color) +  # Set custom team colors
+  scale_x_continuous(limits = c(0, 50)) +
+  theme_classic()
+```
+
+# **Fouls & Referees**
+## Fouls committed per yellow and red card
+In the sport of association football, fouls and misconduct are acts committed by players which are deemed by the referee to be unfair and are subsequently penalised. The referee may consider serious or persistent offences to be misconduct worthy of an official caution or dismissal from the game. The graph below sheds light on the association between fouls committed and the issuance of yellow and red cards. Interestingly, the data reveals a relatively subtle difference in the frequency of yellow cards across teams, but a more pronounced distinction in the case of red cards. Notably, teams like Watford appear to incur a substantial number of fouls before experiencing a red card, while teams like Chelsea tend to receive a red card after a comparatively modest average of four fouls. Whether this is an indication of the severity of fouls generally committed by the team, or potentially biased officiating is beyond what this study can suggest.
+```{r}
+tmp <- soccer %>% 
+  mutate(yellow_home = HF/HY,
+         yellow_away = AF/AY,
+         red_home = HF/HR,
+         red_away = AF/AR) %>% 
+  mutate_at(vars("yellow_home", "yellow_away", "red_home", "red_away"), ~ replace(., !is.finite(.), NA_real_))
+
+df <- data.frame()
+
+for (i in 1:nrow(tmp)) {
+  df <- rbind(df, c(tmp$HomeTeam[i], tmp$yellow_home[i], tmp$red_home[i], "home"))
+  df <- rbind(df, c(tmp$AwayTeam[i], tmp$yellow_away[i], tmp$red_away[i], "away"))
+}
+
+colnames(df) <- c("Team", "Foul_per_yellow", "Foul_per_red", "Location")
+
+df <- df %>% 
+  mutate_at(vars(Foul_per_yellow, Foul_per_red), as.numeric)
+
+foul <- df %>% 
+  group_by(Team) %>% 
+  summarize(mean_foul_per_red = mean(Foul_per_red, na.rm = TRUE),
+            mean_foul_per_yellow = mean(Foul_per_yellow, na.rm = TRUE),
+            .groups = "drop") %>% 
+  na.omit() %>% 
+  pivot_longer(mean_foul_per_red:mean_foul_per_yellow, names_to = "colour", values_to = "rate") 
+
+ggplot(data = foul, aes(x = reorder(Team, rate), y = rate, fill = factor(colour, levels = c("mean_foul_per_yellow", "mean_foul_per_red")))) +
+  geom_col(position = "dodge") +
+  geom_text(aes(y = rate + 0.5, group = colour, label = round(rate)), position = position_dodge(width = -0.8), size = 2.5) + 
+  scale_fill_manual(values = c("#EBE227", "red3"), labels = c("Yellow", "Red"), name = "Card") +
+  coord_flip() +
+  labs(title = "Number of fouls conceived per card awarded to team",
+       y = "Team",
+       x = "")
+```
+
+
+## Relationship between Referee and Winning Team
+Out of curiosity, I wanted to investigate whether the Referee affects the results of the game. Unsurprisingly, as with the requirement of a referee to be impartial, I didn't observe any alarming trends.
+```{r message = FALSE, warning = FALSE}
+ref_home <- soccer %>% 
+  count(Referee, HomeTeam)
+
+ref_away <- soccer %>% 
+  count(Referee, AwayTeam)
+
+ref_total <- ref_home %>% 
+  full_join(ref_away, by = c("HomeTeam" = "AwayTeam", "Referee")) %>% 
+  mutate_at(vars(n.x, n.y), function(x) ifelse(is.na(x), 0, x)) %>% 
+  mutate(n = n.x + n.y) %>% 
+  select(-c(n.x, n.y))
+
+win <- soccer %>% 
+  mutate(winner = ifelse(FTR == "H", HomeTeam, AwayTeam)) %>% 
+  filter(winner %in% top_5) %>%
+  left_join(ref_total, by = c("winner" = "HomeTeam", "Referee")) %>% 
+  group_by(Referee, winner) %>% 
+  summarize(n_prop = round(n()/n, 1))
+
+ggplot(data = win, aes(x = Referee, y = winner)) +
+  geom_tile(aes(fill = n_prop)) + 
+  geom_text(aes(label = n_prop), color = "black", size = 2.7) +
+  scale_fill_gradient(low = "lightblue", high = "dodgerblue4") + 
+  labs(x = "Referee", y = "Winning Team", fill = "Proportion",
+       title = "Proportion of Games Won, Officiated by Different Referees") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+# **Wrap Up**
+In conclusion, the analysis of this data set has provided us with a broad understanding of team performance and overarching match trends. Notably, our analysis challenges the commonly perceived advantage of playing at Home, suggesting that its impact may be overstated. The marginal and diverse changes in goal difference, shooting accuracy, and efficiency at the team level raise interesting considerations. Furthermore, our findings highlight variations in the number of fouls committed per card awarded, particularly for red cards, during the 2021 - 2022 BPL season. These discoveries contribute to a comprehensive view of the dynamics shaping football matches and open avenues for further exploration into the intricacies of team and player performances. A deeper exploration of individual player statistics may unveil more nuanced aspects influencing match outcomes.
